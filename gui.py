@@ -15,7 +15,7 @@ PLACEHOLDER = 'No default image selected. Click Browse to choose a new default.'
 
 class FlashApp(tk.Tk):
     def __init__(self, default_image: str | None, set_default_image: Callable,
-                 extracted_dir: str,
+                 project_dir: str, extracted_dir: str,
                  get_devices: Callable, get_device_size: Callable,
                  flash_device: Callable, extract_device: Callable,
                  get_image_disk_usage: Callable, eject_device: Callable,
@@ -27,6 +27,7 @@ class FlashApp(tk.Tk):
 
         self._default_image       = default_image
         self._set_default_image   = set_default_image
+        self._project_dir         = project_dir
         self._extracted_dir       = extracted_dir
         self._get_devices         = get_devices
         self._get_device_size     = get_device_size
@@ -157,8 +158,12 @@ class FlashApp(tk.Tk):
             self._browse_btn.configure(text='Browse…')
 
     def _browse_image(self) -> None:
+        current = self._image_path.get().strip()
+        initialdir = (os.path.dirname(current)
+                      if current and os.path.isfile(current) else self._project_dir)
         path = filedialog.askopenfilename(
             title='Select Image',
+            initialdir=initialdir,
             filetypes=[('Image files', '*.img *.img.gz'), ('All files', '*.*')],
         )
         if not path:

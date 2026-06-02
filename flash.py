@@ -249,6 +249,7 @@ def main() -> None:
     FlashApp(
         default_image=get_default_image(),
         set_default_image=set_default_image,
+        project_dir=SCRIPT_DIR,
         extracted_dir=EXTRACTED_DIR,
         get_devices=get_removable_devices,
         get_device_size=get_device_size,
