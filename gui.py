@@ -405,6 +405,23 @@ class FlashApp(tk.Tk):
             messagebox.showerror('No Device', 'Please select at least one device.')
             return
 
+        image_size = os.path.getsize(image)
+        too_small = []
+        for device in selected:
+            try:
+                dsize = self._get_device_size(str(device))
+            except Exception:
+                continue
+            if dsize < image_size:
+                too_small.append((device, dsize))
+        if too_small:
+            lines = '\n'.join(f'  {d}  ({human_size(sz)})' for d, sz in too_small)
+            messagebox.showerror(
+                'Card Too Small',
+                f'The image needs {human_size(image_size)}, but these card(s) are '
+                f'smaller:\n\n{lines}')
+            return
+
         targets = '\n'.join(f'  {d}' for d in selected)
         if not messagebox.askyesno(
             'Confirm', f'This will erase all data on:\n\n{targets}\n\nContinue?'

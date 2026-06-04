@@ -65,8 +65,46 @@ def get_removable_devices() -> list[dict]:
         return []
 
 
+def unmount_device(device: str) -> tuple[bool, str]:
+    """Unmount every mounted partition of `device` before writing or reading it.
+
+    A desktop auto-mounter usually mounts a card the moment it is inserted, and
+    writing to the whole-disk node while a partition is mounted can corrupt the
+    write. Returns (True, '') when nothing is mounted or all unmounts succeed.
+    """
+    try:
+        out = subprocess.run(
+            ['lsblk', '-J', '-o', 'PATH,MOUNTPOINT', device],
+            capture_output=True, text=True, check=True,
+        ).stdout
+    except Exception as exc:
+        return False, str(exc)
+
+    mounted: list[str] = []
+
+    def walk(nodes):
+        for n in nodes:
+            if n.get('mountpoint'):
+                mounted.append(n['path'])
+            walk(n.get('children', []))
+
+    try:
+        walk(json.loads(out).get('blockdevices', []))
+    except Exception as exc:
+        return False, str(exc)
+
+    for path in mounted:
+        result = subprocess.run(['umount', path], capture_output=True, text=True)
+        if result.returncode != 0:
+            return False, f'{path}: {result.stderr.strip() or "umount failed"}'
+    return True, ''
+
+
 def flash_device(image: str, device: str,
                  progress_cb: Callable | None = None) -> tuple[bool, str]:
+    ok, err = unmount_device(device)
+    if not ok:
+        return False, f'Could not unmount {device}: {err}'
     total = os.path.getsize(image)
     pat = re.compile(r'(\d+) bytes.*?([\d.]+ \S+/s)')
     stderr_buf = []
@@ -330,6 +368,9 @@ def extract_device(device: str, filename: str, shrink: bool, compress: bool,
     img_path = os.path.join(EXTRACTED_DIR, f'{filename}.img')
 
     try:
+        ok, err = unmount_device(device)
+        if not ok:
+            return False, f'Could not unmount {device}: {err}'
         total = get_device_size(device)
         pat   = re.compile(r'(\d+) bytes.*?([\d.]+ \S+/s)')
 
@@ -392,7 +433,7 @@ def log_flash(image: str, size: str, duration: float, success: bool) -> None:
         ])
 
 
-REQUIRED_TOOLS = ['dd', 'lsblk', 'eject', 'losetup', 'mount', 'gzip', 'df']
+REQUIRED_TOOLS = ['dd', 'lsblk', 'eject', 'losetup', 'mount', 'umount', 'gzip', 'df']
 
 
 def check_dependencies() -> None:
