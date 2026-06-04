@@ -7,6 +7,8 @@ from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
 from typing import Callable
 
+from imagemap import human_size
+
 BAR_WIDTH = 50
 
 
@@ -42,9 +44,12 @@ class FlashApp(tk.Tk):
         self._image_path  = tk.StringVar(value=default_image or '')
         self._source      = tk.StringVar(value='default')
         self._flash_mode  = tk.StringVar(value='sequential')
-        self._verify_after = tk.BooleanVar(value=False)
+        self._verify_after = tk.BooleanVar(value=True)
         self._queue: queue.Queue = queue.Queue()
         self._progress_rows: dict = {}
+        self._cancel_events: dict = {}
+        self._operation = 'flash'
+        self._verify_results: dict = {}
 
         self._build_image_selector()
         self._build_device_list()
@@ -113,6 +118,8 @@ class FlashApp(tk.Tk):
                         variable=self._verify_after).pack(anchor='w', pady=(4, 4))
         self._flash_btn = ttk.Button(btn_frame, text='Flash', command=self._flash)
         self._flash_btn.pack(fill='x')
+        self._verify_btn = ttk.Button(btn_frame, text='Verify', command=self._verify)
+        self._update_verify_button()
 
     def _build_progress(self) -> None:
         self._progress_frame = ttk.LabelFrame(self, text='Progress')
@@ -131,12 +138,32 @@ class FlashApp(tk.Tk):
         speed_label = ttk.Label(row, text='', width=16, anchor='w')
         speed_label.pack(side='left')
 
-        self._progress_rows[device] = (pct_var, speed_label, row)
+        # Shown (packed) only while this device is verifying; see _show_cancel.
+        cancel_btn = ttk.Button(row, text='Cancel', width=11)
+
+        self._progress_rows[device] = (pct_var, speed_label, row, cancel_btn)
+
+    def _show_cancel(self, device: str) -> None:
+        """Reveal the per-device Cancel button and wire it to its cancel event."""
+        if device not in self._progress_rows:
+            return
+        cancel_btn = self._progress_rows[device][3]
+        event = self._cancel_events.get(device)
+        if event is None:
+            return
+
+        def do_cancel():
+            event.set()
+            cancel_btn.configure(state='disabled', text='Cancelling…')
+
+        cancel_btn.configure(text='Cancel', state='normal', command=do_cancel)
+        cancel_btn.pack(side='left', padx=(6, 0))
 
     def _clear_progress_rows(self) -> None:
-        for _, _, row in self._progress_rows.values():
+        for _, _, row, _ in self._progress_rows.values():
             row.destroy()
         self._progress_rows.clear()
+        self._cancel_events.clear()
 
     # ── Callbacks ──────────────────────────────────────────────────────────────
 
@@ -156,6 +183,14 @@ class FlashApp(tk.Tk):
             self._image_path.set('')
             self._path_entry.configure(state='normal', foreground='')
             self._browse_btn.configure(text='Browse…')
+        self._update_verify_button()
+
+    def _update_verify_button(self) -> None:
+        """Show the Verify button only when a default image is the active source."""
+        if self._source.get() == 'default' and self._default_image:
+            self._verify_btn.pack(fill='x', pady=(4, 0))
+        else:
+            self._verify_btn.pack_forget()
 
     def _browse_image(self) -> None:
         current = self._image_path.get().strip()
@@ -173,6 +208,7 @@ class FlashApp(tk.Tk):
             self._set_default_image(path)
             self._path_entry.configure(foreground='')
             self._browse_btn.configure(text='Browse…')
+            self._update_verify_button()
         self._image_path.set(path)
 
     def _on_tree_click(self, event) -> None:
@@ -190,14 +226,15 @@ class FlashApp(tk.Tk):
 
         win = tk.Toplevel(self)
         win.title('Image Details')
-        win.minsize(460, 160)
+        win.minsize(480, 220)
         win.resizable(False, False)
 
         text = tk.Text(win, font=('Monospace', 11), state='disabled',
-                       bg=self.cget('bg'), relief='flat', height=4, width=58)
-        text.tag_configure('used',  foreground='#4caf50')
-        text.tag_configure('free',  foreground='#555555')
-        text.tag_configure('label', foreground='#aaaaaa')
+                       bg=self.cget('bg'), relief='flat', height=6, width=58)
+        text.tag_configure('used',    foreground='#4caf50')
+        text.tag_configure('free',    foreground='#555555')
+        text.tag_configure('unalloc', foreground='#e0a030')
+        text.tag_configure('label',   foreground='#aaaaaa')
         text.pack(padx=16, pady=16)
 
         def _set(content: list[tuple[str, str]]) -> None:
@@ -225,13 +262,30 @@ class FlashApp(tk.Tk):
                 if result is None:
                     win.after(0, lambda: _set([('label', 'Could not read image disk usage.')]))
                     return
-                used, total = result
-                free   = total - used
-                pct    = used / total if total else 0
-                filled = round(BAR_WIDTH * pct)
-                empty  = BAR_WIDTH - filled
-                bar   = [('used', '█' * filled), ('free', '░' * empty)]
-                stats = [('label', f'\nUsed: {fmt(used)}  Free: {fmt(free)}  Total: {fmt(total)}  ({pct*100:.1f}%)')]
+                file_size = result['file_size']
+                part_size = result['part_size']
+                fs_used   = result['fs_used']
+                fs_total  = result['fs_total']
+                pct       = fs_used / fs_total if fs_total else 0
+                # Space inside the root partition the filesystem doesn't occupy: what
+                # PiShrink reclaims. df only sees inside the filesystem, so it misses this.
+                unused    = max(part_size - fs_total, 0)
+
+                # Bar spans the root partition: used | free-in-fs | unused partition space
+                used_w   = min(round(BAR_WIDTH * fs_used / part_size), BAR_WIDTH) if part_size else 0
+                free_w   = round(BAR_WIDTH * max(fs_total - fs_used, 0) / part_size) if part_size else 0
+                free_w   = min(free_w, BAR_WIDTH - used_w)
+                unused_w = BAR_WIDTH - used_w - free_w
+                bar = [('used', '█' * used_w), ('free', '░' * free_w), ('unalloc', '▒' * unused_w)]
+
+                stats = [
+                    ('label', f'\nFilesystem:  {fmt(fs_used)} used / {fmt(fs_total)}  ({pct*100:.1f}%)'),
+                    ('label', f'\nPartition:   {fmt(part_size)}'),
+                    ('label', f'\nImage file:  {fmt(file_size)}'),
+                ]
+                if unused_w > 0:
+                    stats.append(
+                        ('unalloc', f'\nUnused:      {fmt(unused)}  (partition space PiShrink reclaims)'))
                 win.after(0, lambda: _set(bar + stats))
 
             threading.Thread(target=worker, daemon=True).start()
@@ -265,7 +319,7 @@ class FlashApp(tk.Tk):
             size_gb    = 0
 
         win = tk.Toplevel(self)
-        win.title(f'Extract Image — {device}')
+        win.title(f'Extract Image - {device}')
         win.resizable(False, False)
 
         pad = dict(padx=16, pady=4)
@@ -315,7 +369,9 @@ class FlashApp(tk.Tk):
             messagebox.showerror('No Filename', 'Please enter a filename.', parent=win)
             return
         win.destroy()
+        self._operation = 'extract'
         self._flash_btn.configure(state='disabled')
+        self._verify_btn.configure(state='disabled')
         self._clear_progress_rows()
         self._add_progress_row(device)
         self._remaining = 1
@@ -355,7 +411,9 @@ class FlashApp(tk.Tk):
         ):
             return
 
+        self._operation = 'flash'
         self._flash_btn.configure(state='disabled')
+        self._verify_btn.configure(state='disabled')
         self._clear_progress_rows()
         for device in selected:
             self._add_progress_row(device)
@@ -372,10 +430,17 @@ class FlashApp(tk.Tk):
             start = time.monotonic()
             ok, err = self._flash_device(image, device, progress_cb)
             if ok and verify_after:
-                self._queue.put(('progress', device, 100, 'Verifying…'))
-                ok, err = self._verify_device(image, device)
-                if not ok:
-                    err = f'Verification failed: {err}'
+                event = threading.Event()
+                self._cancel_events[device] = event
+                self._queue.put(('verifying', device))
+                self._queue.put(('progress', device, 0, 'Verifying…'))
+                result = self._verify_device(image, device, progress_cb, event.is_set)
+                if result.status == 'cancelled':
+                    ok = True            # flash already succeeded; verify was skipped
+                else:
+                    ok = result.status in ('match', 'benign')
+                    if not ok:
+                        err = f'Verification failed: {result.detail}'
             duration = time.monotonic() - start
             if is_default:
                 self._log_flash(image, selected_info.get(device, '?'), duration, ok)
@@ -396,6 +461,182 @@ class FlashApp(tk.Tk):
 
         self._poll_queue()
 
+    def _verify(self) -> None:
+        image = self._image_path.get().strip()
+        if not image:
+            messagebox.showerror('No Image', 'Please select an image file first.')
+            return
+        if not os.path.isfile(image):
+            messagebox.showerror('File Not Found', f'Image not found:\n{image}')
+            return
+
+        selected = [self._tree.item(iid)['values'][0] for iid in self._tree.selection()]
+        if not selected:
+            messagebox.showerror('No Device', 'Please select at least one device.')
+            return
+
+        self._operation = 'verify'
+        self._verify_results = {}
+        self._flash_btn.configure(state='disabled')
+        self._verify_btn.configure(state='disabled')
+        self._clear_progress_rows()
+        for device in selected:
+            self._add_progress_row(device)
+        self._remaining = len(selected)
+
+        def verify_one(device):
+            event = threading.Event()
+            self._cancel_events[device] = event
+            self._queue.put(('verifying', device))
+
+            def progress_cb(pct, speed):
+                self._queue.put(('progress', device, pct, speed))
+            result = self._verify_device(image, str(device), progress_cb, event.is_set)
+            self._verify_results[device] = result
+            ok = result.status in ('match', 'benign')
+            self._queue.put(('done', device, ok, False, result.detail))
+
+        if self._flash_mode.get() == 'concurrent':
+            for device in selected:
+                threading.Thread(target=verify_one, args=(device,), daemon=True).start()
+        else:
+            def run_sequential():
+                for device in selected:
+                    verify_one(device)
+            threading.Thread(target=run_sequential, daemon=True).start()
+
+        self._poll_queue()
+
+    def _done_text(self, device: str, ok: bool, ejected: bool) -> str:
+        if self._operation == 'verify':
+            result = self._verify_results.get(device)
+            status = result.status if result else 'mismatch'
+            return {
+                'match':     'Verified ✓',
+                'benign':    'Verified ⚠',
+                'mismatch':  'Mismatch ✗',
+                'cancelled': 'Cancelled',
+                'error':     'Error',
+            }.get(status, 'Mismatch ✗')
+        if not ok:
+            return 'Error'
+        return 'Done, Ejected' if ejected else 'Done'
+
+    def _diff_bar(self, res, width: int = BAR_WIDTH) -> list[tuple[str, str]]:
+        """A BAR_WIDTH-cell map of the card: each cell flags the worst diff in it.
+
+        Returns (tag, text) runs; real (red) outranks benign (green) outranks
+        match (grey), and any region (however tiny) claims at least one cell.
+        Cells past where the scan stopped are shown as 'unknown', not match.
+        """
+        total = res.total or 1
+        scanned = res.scanned or total
+        marks = [0] * width
+        # cells lying entirely beyond the scanned point: not checked, so unknown
+        for c in range(width):
+            if c * total // width >= scanned:
+                marks[c] = 3
+        for r in res.regions:
+            if r.start >= total:
+                continue
+            c0 = max(r.start * width // total, 0)
+            c1 = min((min(r.end, total) - 1) * width // total, width - 1)
+            val = 2 if not r.benign else 1
+            for c in range(c0, c1 + 1):
+                marks[c] = val if marks[c] == 3 else max(marks[c], val)
+        chars = {0: '░', 1: '▒', 2: '█', 3: '·'}
+        tags  = {0: 'match', 1: 'benign', 2: 'real', 3: 'unknown'}
+        runs: list[tuple[str, str]] = []
+        for m in marks:
+            if runs and runs[-1][0] == tags[m]:
+                runs[-1] = (tags[m], runs[-1][1] + chars[m])
+            else:
+                runs.append((tags[m], chars[m]))
+        return runs
+
+    def _show_verify_report(self) -> None:
+        results = self._verify_results  # device -> VerifyResult
+        if all(r.status == 'match' for r in results.values()):
+            messagebox.showinfo(
+                'Verify Complete', f'All {len(results)} device(s) match the image.')
+            return
+
+        win = tk.Toplevel(self)
+        win.title('Verify Report')
+        win.minsize(660, 460)
+
+        intro = {'match': 'matches', 'benign': 'OS mount metadata only',
+                 'mismatch': 'REAL differences', 'cancelled': 'cancelled (partial scan)',
+                 'error': 'error'}
+
+        # ── card map (one coloured bar per device, Details-window style) ──────
+        text = tk.Text(win, font=('Monospace', 11), state='disabled',
+                       bg=self.cget('bg'), relief='flat', width=58,
+                       height=len(results) * 3 + 2)
+        text.tag_configure('match',   foreground='#555555')
+        text.tag_configure('benign',  foreground='#4caf50')
+        text.tag_configure('real',    foreground='#c0392b')
+        text.tag_configure('unknown', foreground='#c9a227')
+        text.tag_configure('label',   foreground='#aaaaaa')
+        text.pack(fill='x', padx=10, pady=(10, 4))
+
+        any_unscanned = any(0 < r.scanned < r.total for r in results.values())
+        content: list[tuple[str, str]] = []
+        for device, res in results.items():
+            content.append(('label', f'{device}   -   {intro.get(res.status, res.status)}\n'))
+            content.append(('label', '  '))
+            content.extend(self._diff_bar(res))
+            content.append(('label', '\n\n'))
+        content += [('label', '  '), ('real', '█'), ('label', ' real   '),
+                    ('benign', '▒'), ('label', ' benign   '),
+                    ('match', '░'), ('label', ' match')]
+        if any_unscanned:
+            content += [('label', '   '), ('unknown', '·'), ('label', ' not scanned')]
+        text.configure(state='normal')
+        for tag, chunk in content:
+            text.insert('end', chunk, tag)
+        text.configure(state='disabled')
+
+        # ── per-region breakdown ─────────────────────────────────────────────
+        tree = ttk.Treeview(win, columns=('size', 'kind'), show='tree headings')
+        tree.heading('#0', text='Device / region')
+        tree.column('#0', width=380)
+        tree.heading('size', text='Size')
+        tree.column('size', width=110, anchor='e')
+        tree.heading('kind', text='REAL / benign')
+        tree.column('kind', width=110, anchor='center')
+        tree.tag_configure('real',    foreground='#c0392b')
+        tree.tag_configure('benign',  foreground='#4caf50')
+        tree.tag_configure('unknown', foreground='#c9a227')
+
+        for device, res in results.items():
+            parent = tree.insert('', 'end', open=True,
+                                 text=f'{device}   -   {intro.get(res.status, res.status)}')
+            if res.status == 'error':
+                tree.insert(parent, 'end', text=res.detail)
+                continue
+            groups: dict = {}
+            for r in res.regions:
+                sz, cnt = groups.get((r.label, r.benign), (0, 0))
+                groups[(r.label, r.benign)] = (sz + r.size, cnt + 1)
+            # real differences first, then benign, each alphabetised by label
+            for (label, benign), (sz, cnt) in sorted(
+                    groups.items(), key=lambda kv: (kv[0][1], kv[0][0])):
+                text_ = label + (f'   ({cnt} regions)' if cnt > 1 else '')
+                tree.insert(parent, 'end', text=text_,
+                            values=(human_size(sz), 'benign' if benign else 'REAL'),
+                            tags=('benign' if benign else 'real',))
+            if 0 < res.scanned < res.total:
+                tree.insert(parent, 'end',
+                            text='stopped early: remainder not scanned',
+                            values=(human_size(res.total - res.scanned), 'not scanned'),
+                            tags=('unknown',))
+            elif res.truncated:
+                tree.insert(parent, 'end', text='… more regions not shown')
+
+        tree.pack(fill='both', expand=True, padx=10, pady=(0, 10))
+        ttk.Button(win, text='Close', command=win.destroy).pack(pady=(0, 10))
+
     def _poll_queue(self) -> None:
         try:
             while True:
@@ -403,24 +644,26 @@ class FlashApp(tk.Tk):
                 if msg[0] == 'progress':
                     _, device, pct, speed = msg
                     if device in self._progress_rows:
-                        pct_var, speed_label, _ = self._progress_rows[device]
+                        pct_var, speed_label, _, _ = self._progress_rows[device]
                         pct_var.set(pct)
                         speed_label.configure(text=speed)
+                elif msg[0] == 'verifying':
+                    self._show_cancel(msg[1])
                 elif msg[0] == 'done':
                     _, device, ok, ejected, result = msg
                     if device in self._progress_rows:
-                        pct_var, speed_label, _ = self._progress_rows[device]
+                        pct_var, speed_label, _, cancel_btn = self._progress_rows[device]
                         pct_var.set(100)
-                        if ok:
-                            speed_label.configure(
-                                text='Done, Ejected' if ejected else 'Done')
-                        else:
-                            speed_label.configure(text='Error')
+                        speed_label.configure(text=self._done_text(device, ok, ejected))
+                        cancel_btn.pack_forget()
                     self._remaining -= 1
-                    if not ok:
+                    if not ok and self._operation != 'verify':
                         messagebox.showerror('Error', f'{device}:\n{result}')
                     if self._remaining == 0:
                         self._flash_btn.configure(state='normal')
+                        self._verify_btn.configure(state='normal')
+                        if self._operation == 'verify':
+                            self._show_verify_report()
                         return
         except queue.Empty:
             pass

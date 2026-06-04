@@ -7,8 +7,12 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable
+
+import imagemap
 from gui import FlashApp
 
 SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
@@ -89,8 +93,18 @@ def flash_device(image: str, device: str,
     return False, ''.join(stderr_buf)
 
 
-def get_image_disk_usage(image: str) -> tuple[int, int] | None:
-    """Return (used_bytes, total_bytes) by mounting the image's root partition."""
+def get_image_disk_usage(image: str) -> dict | None:
+    """Describe the image's root filesystem and overall layout, or None on failure.
+
+    Returns a dict:
+      file_size  – size of the .img file on disk
+      part_size  – size of the root (p2) partition
+      fs_used    – bytes used inside the root filesystem (from df)
+      fs_total   – total size of the root filesystem (from df)
+
+    The gap between part_size and file_size is trailing unallocated space: the
+    empty tail PiShrink trims away, which df cannot see.
+    """
     loop_dev = None
     mountpoint = None
     try:
@@ -98,10 +112,19 @@ def get_image_disk_usage(image: str) -> tuple[int, int] | None:
             ['losetup', '--find', '--show', '--partscan', image],
             capture_output=True, text=True, check=True,
         ).stdout.strip()
+        part = f'{loop_dev}p2'
+
+        try:
+            part_size = int(subprocess.run(
+                ['lsblk', '-b', '-d', '-n', '-o', 'SIZE', part],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip())
+        except Exception:
+            part_size = None
 
         mountpoint = tempfile.mkdtemp()
         subprocess.run(
-            ['mount', '-o', 'ro', f'{loop_dev}p2', mountpoint],
+            ['mount', '-o', 'ro', part, mountpoint],
             capture_output=True, check=True,
         )
 
@@ -110,7 +133,14 @@ def get_image_disk_usage(image: str) -> tuple[int, int] | None:
             capture_output=True, text=True, check=True,
         ).stdout
         fields = out.strip().split('\n')[1].split()
-        return int(fields[2]), int(fields[1])
+        fs_used, fs_total = int(fields[2]), int(fields[1])
+
+        return {
+            'file_size': os.path.getsize(image),
+            'part_size': part_size if part_size is not None else fs_total,
+            'fs_used':   fs_used,
+            'fs_total':  fs_total,
+        }
     except Exception:
         return None
     finally:
@@ -121,15 +151,159 @@ def get_image_disk_usage(image: str) -> tuple[int, int] | None:
             subprocess.run(['losetup', '-d', loop_dev], capture_output=True)
 
 
-def verify_device(image: str, device: str) -> tuple[bool, str]:
-    size = os.path.getsize(image)
-    result = subprocess.run(
-        ['cmp', '-n', str(size), image, device],
-        capture_output=True, text=True,
-    )
-    if result.returncode == 0:
-        return True, ''
-    return False, result.stdout or result.stderr
+def _fmt_speed(bytes_per_sec: float) -> str:
+    for unit in ('B/s', 'KB/s', 'MB/s', 'GB/s'):
+        if bytes_per_sec < 1024:
+            return f'{bytes_per_sec:.1f} {unit}'
+        bytes_per_sec /= 1024
+    return f'{bytes_per_sec:.1f} TB/s'
+
+
+def _diff_ranges(a: bytes, b: bytes, base: int, window: int = 4096):
+    """Yield (start, end) byte ranges where a and b differ, runs coalesced.
+
+    Compares window-sized slices at C speed and only descends byte-by-byte into
+    slices that actually differ, so a device that matches except for small
+    metadata regions stays cheap to scan.
+    """
+    n = len(a)
+    i = 0
+    cur = None
+    while i < n:
+        aw = a[i:i + window]
+        bw = b[i:i + window]
+        if aw == bw:
+            if cur:
+                yield cur
+                cur = None
+            i += window
+            continue
+        for j in range(len(aw)):
+            if j >= len(bw) or aw[j] != bw[j]:
+                off = base + i + j
+                if cur and cur[1] == off:
+                    cur = (cur[0], off + 1)
+                else:
+                    if cur:
+                        yield cur
+                    cur = (off, off + 1)
+            elif cur:
+                yield cur
+                cur = None
+        i += window
+    if cur:
+        yield cur
+
+
+@dataclass
+class VerifyResult:
+    """Outcome of verify_device.
+
+    status:  match | benign | mismatch | error
+    detail:  one-line human summary (also shown in the device row)
+    regions: classified imagemap.DiffRegion list (benign + real, with labels)
+    """
+    status: str
+    detail: str
+    regions: list = field(default_factory=list)
+    diff_bytes: int = 0
+    truncated: bool = False
+    total: int = 0
+    scanned: int = 0    # bytes actually compared; < total if the scan stopped early
+
+
+# Stop refining once this many differing bytes are seen: well above the largest
+# benign region (the ext4 journal), so a genuinely-wrong card can't hang the scan.
+_DIFF_SCAN_CAP = 96 * 1024 * 1024
+_MAX_RANGES    = 20000
+
+
+def verify_device(image: str, device: str,
+                  progress_cb: Callable | None = None,
+                  is_cancelled: Callable | None = None) -> VerifyResult:
+    """Compare the first len(image) bytes of `device` against `image` in full.
+
+    Scans the whole device, collecting every differing byte range, then labels
+    each via imagemap.ImageMap. Differences that fall in mount-volatile regions
+    (FAT dirty flag / FSInfo, ext4 superblock mount fields, ext4 journal) are
+    benign; anything else is real. The live count is reported through progress_cb.
+
+    `is_cancelled()` is polled once per chunk; if it returns True the scan stops
+    and returns a 'cancelled' result with whatever was found so far (the unread
+    tail is reported as not-scanned, like any other early stop).
+    """
+    total = os.path.getsize(image)
+    bs    = 4 * 1024 * 1024
+    read  = 0
+    start = time.monotonic()
+    raw: list[tuple[int, int]] = []
+    diff_bytes = 0
+    truncated  = False
+    short      = None
+    try:
+        with open(image, 'rb') as img, open(device, 'rb') as dev:
+            while read < total:
+                if is_cancelled is not None and is_cancelled():
+                    regions = imagemap.ImageMap(image).classify(raw)
+                    return VerifyResult(
+                        'cancelled',
+                        f'Cancelled after {imagemap.human_size(read)} '
+                        f'of {imagemap.human_size(total)}',
+                        regions, diff_bytes, True, total, read)
+                chunk = img.read(min(bs, total - read))
+                if not chunk:
+                    break
+                other = dev.read(len(chunk))
+                if len(other) < len(chunk):
+                    short = (read + len(other), total)
+                    diff_bytes += total - (read + len(other))
+                    break
+                if other != chunk:
+                    for s, e in _diff_ranges(chunk, other, read):
+                        diff_bytes += e - s
+                        if raw and raw[-1][1] == s:          # contiguous across windows
+                            raw[-1] = (raw[-1][0], e)
+                        elif len(raw) < _MAX_RANGES:
+                            raw.append((s, e))
+                        else:
+                            truncated = True
+                read += len(chunk)
+                # Stop once the card is clearly a mismatch: too many differing
+                # regions to list, or more raw difference than worth finishing.
+                if len(raw) >= _MAX_RANGES or diff_bytes > _DIFF_SCAN_CAP:
+                    truncated = True
+                    break
+                if progress_cb and total > 0:
+                    elapsed = time.monotonic() - start
+                    n = len(raw) + (1 if short else 0)
+                    status = (f'{n} mismatch' + ('' if n == 1 else 'es')) if n \
+                        else (_fmt_speed(read / elapsed) if elapsed else '')
+                    progress_cb(min(read / total * 100, 99), status)
+    except Exception as exc:
+        return VerifyResult('error', str(exc), total=total, scanned=read)
+
+    # `read` now marks how far we actually compared; a short device still counts
+    # as fully scanned because its missing tail is recorded as a real difference.
+    scanned = total if (short or read >= total) else read
+
+    regions = imagemap.ImageMap(image).classify(raw)
+    if short:
+        regions.append(imagemap.DiffRegion(short[0], short[1],
+                                           'device shorter than image', False))
+    if not regions:
+        return VerifyResult('match', '', total=total, scanned=scanned)
+
+    real = [r for r in regions if not r.benign]
+    if real:
+        labels = ', '.join(sorted({r.label for r in real}))
+        size   = imagemap.human_size(sum(r.size for r in real))
+        suffix = ' (scan stopped early)' if scanned < total else \
+                 (' (+more)' if truncated else '')
+        return VerifyResult('mismatch', f'{size} differ in {labels}{suffix}',
+                            regions, diff_bytes, truncated, total, scanned)
+    labels = ', '.join(sorted({r.label for r in regions}))
+    return VerifyResult('benign', f'Only OS mount metadata differs: {labels}',
+                        regions, diff_bytes, truncated, total, scanned)
 
 
 def shrink_image(image: str) -> tuple[bool, str]:
@@ -218,7 +392,7 @@ def log_flash(image: str, size: str, duration: float, success: bool) -> None:
         ])
 
 
-REQUIRED_TOOLS = ['dd', 'lsblk', 'cmp', 'eject', 'losetup', 'mount', 'gzip', 'df']
+REQUIRED_TOOLS = ['dd', 'lsblk', 'eject', 'losetup', 'mount', 'gzip', 'df']
 
 
 def check_dependencies() -> None:

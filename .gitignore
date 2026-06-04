@@ -1,2 +1,4 @@
 extracted_images/
 __pycache__/
+config.json
+flash_log.csv
