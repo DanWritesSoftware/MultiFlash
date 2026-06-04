@@ -18,8 +18,8 @@ Linux desktop tool providing multiple utilities for provisioning batches of SD c
 
 **Requirements**
 
-Python 3 (uses standard library exclusively with no pip packages)
-Most modern Debian/Ubuntu based Linux systems with a graphical desktop
+* Python 3 (uses standard library exclusively with no pip packages)
+* Most modern Debian/Ubuntu based Linux systems with a graphical desktop
   * System tools: 'dd', 'lsblk', 'losetup', 'mount', 'umount', 'df', 'eject', 'gzip', 'parted', 'xz-utils'
   * A polkit agent for privilege prompt
   * python3-tk apt package not included on some systems
