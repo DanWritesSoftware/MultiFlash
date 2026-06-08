@@ -2,12 +2,15 @@
 
 import csv
 import json
+import lzma
 import os
 import re
 import subprocess
 import sys
 import tempfile
 import time
+import zipfile
+import zlib
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable
@@ -65,6 +68,128 @@ def get_removable_devices() -> list[dict]:
         return []
 
 
+def compressed_kind(path: str) -> str | None:
+    """Return 'gz' | 'xz' | 'zip' for a compressed image, else None."""
+    p = path.lower()
+    if p.endswith('.gz'):
+        return 'gz'
+    if p.endswith('.xz'):
+        return 'xz'
+    if p.endswith('.zip'):
+        return 'zip'
+    return None
+
+
+def is_compressed(path: str) -> bool:
+    return compressed_kind(path) is not None
+
+
+def _zip_entry(zf: zipfile.ZipFile):
+    """The largest non-directory entry in a zip (assumed to be the image)."""
+    files = [i for i in zf.infolist() if not i.is_dir()]
+    return max(files, key=lambda i: i.file_size) if files else None
+
+
+def uncompressed_size(path: str) -> int | None:
+    """Best-effort uncompressed size, or None when it can't be read cheaply.
+
+    Reliable for .zip (central directory) and .xz (`xz --list`); a .gz only
+    stores the low 32 bits of the size, so it is reported as unknown.
+    """
+    kind = compressed_kind(path)
+    try:
+        if kind == 'zip':
+            with zipfile.ZipFile(path) as zf:
+                entry = _zip_entry(zf)
+                return entry.file_size if entry else None
+        if kind == 'xz':
+            out = subprocess.run(['xz', '--robot', '--list', path],
+                                 capture_output=True, text=True, check=True).stdout
+            for line in out.splitlines():
+                fields = line.split('\t')
+                if fields and fields[0] == 'file':
+                    return int(fields[4])
+    except Exception:
+        pass
+    return None
+
+
+def _flash_compressed(image: str, device: str,
+                      progress_cb: Callable | None = None) -> tuple[bool, str]:
+    """Stream-decompress `image` straight onto `device` with no temp file.
+
+    Decompression runs in Python and is piped into `dd`, which owns the device
+    write (pipe backpressure throttles us to the card's speed). Progress is the
+    fraction of the compressed input consumed; speed is the uncompressed write rate.
+    """
+    kind  = compressed_kind(image)
+    bs    = 4 * 1024 * 1024
+    start = time.monotonic()
+    proc = subprocess.Popen(
+        ['dd', f'of={device}', 'bs=4M', 'conv=fsync'],
+        stdin=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+
+    def report(pct: float, written: int) -> None:
+        if progress_cb:
+            elapsed = time.monotonic() - start
+            progress_cb(min(pct, 99), _fmt_speed(written / elapsed) if elapsed else '')
+
+    try:
+        if kind == 'zip':
+            with zipfile.ZipFile(image) as zf:
+                entry = _zip_entry(zf)
+                if entry is None:
+                    proc.stdin.close()
+                    proc.wait()
+                    return False, 'zip archive contains no file'
+                total = entry.file_size or 0
+                written = 0
+                with zf.open(entry) as src:
+                    while True:
+                        data = src.read(bs)
+                        if not data:
+                            break
+                        proc.stdin.write(data)
+                        written += len(data)
+                        report(written / total * 100 if total else 0, written)
+        else:
+            comp_total = os.path.getsize(image)
+            dctx = zlib.decompressobj(zlib.MAX_WBITS | 16) if kind == 'gz' \
+                else lzma.LZMADecompressor()
+            read = written = 0
+            with open(image, 'rb') as src:
+                while True:
+                    chunk = src.read(bs)
+                    if not chunk:
+                        break
+                    data = dctx.decompress(chunk)
+                    if data:
+                        proc.stdin.write(data)
+                        written += len(data)
+                    read += len(chunk)
+                    report(read / comp_total * 100 if comp_total else 0, written)
+                if kind == 'gz':
+                    tail = dctx.flush()
+                    if tail:
+                        proc.stdin.write(tail)
+        proc.stdin.close()
+        proc.wait()
+        if proc.returncode != 0:
+            return False, proc.stderr.read().decode(errors='replace') or 'dd failed'
+        return True, ''
+    except BrokenPipeError:
+        proc.wait()
+        return False, proc.stderr.read().decode(errors='replace') or 'write to device failed'
+    except Exception as exc:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        proc.wait()
+        return False, str(exc)
+
+
 def unmount_device(device: str) -> tuple[bool, str]:
     """Unmount every mounted partition of `device` before writing or reading it.
 
@@ -105,6 +230,8 @@ def flash_device(image: str, device: str,
     ok, err = unmount_device(device)
     if not ok:
         return False, f'Could not unmount {device}: {err}'
+    if is_compressed(image):
+        return _flash_compressed(image, device, progress_cb)
     total = os.path.getsize(image)
     pat = re.compile(r'(\d+) bytes.*?([\d.]+ \S+/s)')
     stderr_buf = []
@@ -475,6 +602,8 @@ def main() -> None:
         verify_device=verify_device,
         shrink_image=shrink_image,
         log_flash=log_flash,
+        is_compressed=is_compressed,
+        uncompressed_size=uncompressed_size,
     ).mainloop()
 
 

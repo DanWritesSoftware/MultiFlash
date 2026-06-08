@@ -22,7 +22,8 @@ class FlashApp(tk.Tk):
                  flash_device: Callable, extract_device: Callable,
                  get_image_disk_usage: Callable, eject_device: Callable,
                  verify_device: Callable, shrink_image: Callable,
-                 log_flash: Callable):
+                 log_flash: Callable,
+                 is_compressed: Callable, uncompressed_size: Callable):
         super().__init__()
         self.title('MultiFlash')
         self.minsize(800, 480)
@@ -40,6 +41,8 @@ class FlashApp(tk.Tk):
         self._verify_device       = verify_device
         self._shrink_image        = shrink_image
         self._log_flash           = log_flash
+        self._is_compressed       = is_compressed
+        self._uncompressed_size   = uncompressed_size
 
         self._image_path  = tk.StringVar(value=default_image or '')
         self._source      = tk.StringVar(value='default')
@@ -186,8 +189,9 @@ class FlashApp(tk.Tk):
         self._update_verify_button()
 
     def _update_verify_button(self) -> None:
-        """Show the Verify button only when a default image is the active source."""
-        if self._source.get() == 'default' and self._default_image:
+        """Show Verify only for a raw default image (verify needs the raw .img)."""
+        if (self._source.get() == 'default' and self._default_image
+                and not self._is_compressed(self._default_image)):
             self._verify_btn.pack(fill='x', pady=(4, 0))
         else:
             self._verify_btn.pack_forget()
@@ -199,7 +203,8 @@ class FlashApp(tk.Tk):
         path = filedialog.askopenfilename(
             title='Select Image',
             initialdir=initialdir,
-            filetypes=[('Image files', '*.img *.img.gz'), ('All files', '*.*')],
+            filetypes=[('Image files', '*.img *.img.gz *.img.xz *.gz *.xz *.zip'),
+                       ('All files', '*.*')],
         )
         if not path:
             return
@@ -222,6 +227,12 @@ class FlashApp(tk.Tk):
         image = self._image_path.get().strip()
         if not image or not os.path.isfile(image):
             messagebox.showerror('No Image', 'Please select a valid image file first.')
+            return
+        if self._is_compressed(image):
+            messagebox.showinfo(
+                'Details Unavailable',
+                'Image Details are available for raw .img files only, '
+                'not compressed images.')
             return
 
         win = tk.Toplevel(self)
@@ -405,7 +416,10 @@ class FlashApp(tk.Tk):
             messagebox.showerror('No Device', 'Please select at least one device.')
             return
 
-        image_size = os.path.getsize(image)
+        # For a compressed image, the card must fit the *uncompressed* size; if
+        # that can't be determined (e.g. .gz), skip the check rather than guess.
+        image_size = (self._uncompressed_size(image) or 0) if self._is_compressed(image) \
+            else os.path.getsize(image)
         too_small = []
         for device in selected:
             try:
@@ -446,7 +460,7 @@ class FlashApp(tk.Tk):
                 self._queue.put(('progress', device, pct, speed))
             start = time.monotonic()
             ok, err = self._flash_device(image, device, progress_cb)
-            if ok and verify_after:
+            if ok and verify_after and not self._is_compressed(image):
                 event = threading.Event()
                 self._cancel_events[device] = event
                 self._queue.put(('verifying', device))
@@ -485,6 +499,11 @@ class FlashApp(tk.Tk):
             return
         if not os.path.isfile(image):
             messagebox.showerror('File Not Found', f'Image not found:\n{image}')
+            return
+        if self._is_compressed(image):
+            messagebox.showinfo(
+                'Verify Unavailable',
+                'Verify works on raw .img files only, not compressed images.')
             return
 
         selected = [self._tree.item(iid)['values'][0] for iid in self._tree.selection()]
